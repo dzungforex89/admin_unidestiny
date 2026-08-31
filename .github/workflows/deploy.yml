@@ -1,0 +1,96 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: admin-staging-deploy
+  cancel-in-progress: true
+
+env:
+  DEPLOY_PATH: /home/share/tuvi/staging/admin_unidestiny
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SERVER_PORT" "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Create deploy directory
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+        run: ssh -i ~/.ssh/id_ed25519 -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" "mkdir -p '$DEPLOY_PATH'"
+
+      - name: Sync source to server
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.env' \
+            --exclude 'node_modules/' \
+            --exclude '.next/' \
+            -e "ssh -i ~/.ssh/id_ed25519 -p $SERVER_PORT" \
+            ./ "$SERVER_USER@$SERVER_HOST:$DEPLOY_PATH/"
+
+      - name: Deploy to server
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+          ADMIN_ENV: ${{ secrets.ADMIN_ENV }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" "mkdir -p '$DEPLOY_PATH'"
+          if [ -n "$ADMIN_ENV" ]; then
+            printf '%s\n' "$ADMIN_ENV" | ssh -i ~/.ssh/id_ed25519 -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" "cat > '$DEPLOY_PATH/.env'"
+          fi
+          ssh -i ~/.ssh/id_ed25519 -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" "DEPLOY_PATH='$DEPLOY_PATH' bash -s" <<'EOF'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          npm ci
+          npm run build
+          if command -v pm2 >/dev/null 2>&1; then
+            pm2 describe unidestiny-admin >/dev/null 2>&1 \
+              && pm2 restart unidestiny-admin \
+              || pm2 start npm --name unidestiny-admin --prefix "$DEPLOY_PATH" -- run start
+            pm2 save
+          fi
+          EOF
